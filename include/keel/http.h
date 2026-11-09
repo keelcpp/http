@@ -11,7 +11,7 @@ namespace keel {
 // ============================================================================
 
 struct ParsedUrl {
-    InplaceString<16> scheme{}; // "http", "https", "ws", "wss" (lowercase)
+    FixedString<16> scheme{};   // "http", "https", "ws", "wss" (lowercase)
     String host{};              // Domain, IPv4, or unbracketed IPv6
     u16 port = 0;               // Explicit or default port (80 or 443)
     String path_and_query{};    // Starts with '/', includes '?query' if present

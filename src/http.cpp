@@ -1,7 +1,7 @@
 #include "keel/http.h"
 #include "keel/format.h"
 #include "keel/number.h"
-#include "keel/ring_buffer.h"
+#include "keel/ring.h"
 
 #include <chrono>
 #include <cstring>
@@ -897,7 +897,7 @@ struct WebSocketClient::Impl {
     }
 #elif defined(__EMSCRIPTEN__)
     EMSCRIPTEN_WEBSOCKET_T ws_handle = 0;
-    RingBuffer<WebSocketMessage> incoming_queue{};
+    Ring<WebSocketMessage> incoming_queue{};
 
     void cleanup_handles() noexcept {
         if (ws_handle > 0) {
