@@ -59,7 +59,7 @@ namespace {
 }
 
 // Guards against CRLF header injection in caller-supplied HTTP headers.
-[[nodiscard]] bool is_safe_header_token(StringRef sv) noexcept {
+[[maybe_unused]] [[nodiscard]] bool is_safe_header_token(StringRef sv) noexcept {
     for (usize i = 0; i < sv.size(); ++i) {
         const char c = sv[i];
         if (c == '\r' || c == '\n' || c == '\0') {
@@ -69,7 +69,7 @@ namespace {
     return true;
 }
 
-[[nodiscard]] const char* http_method_to_cstr(HttpMethod method) noexcept {
+[[maybe_unused]] [[nodiscard]] const char* http_method_to_cstr(HttpMethod method) noexcept {
     switch (method) {
         case HttpMethod::Get:    return "GET";
         case HttpMethod::Post:   return "POST";
@@ -785,6 +785,12 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
         if (!resp || total == 0) return total;
         StringRef line(buffer, total);
         line = trim_ascii(line);
+        if (line.size() >= 5 && equals_ignore_case(line.substr(0, 5), "HTTP/")) {
+            // Reset intermediate 3xx redirect headers when a new HTTP status line begins
+            resp->headers.clear();
+            resp->content_type.clear();
+            return total;
+        }
         const usize colon = line.find(':');
         if (colon != StringRef::npos && colon > 0) {
             const StringRef name_ref = trim_ascii(line.substr(0, colon));
@@ -884,6 +890,7 @@ struct WebSocketClient::Impl {
     WebSocketState state = WebSocketState::Disconnected;
     String last_error{};
     usize max_message_bytes = 16u * 1024u * 1024u;
+    u32 read_timeout_ms = 5000;
 
 #if defined(_WIN32)
     ScopedWinHttpHandle h_session{};
@@ -1199,8 +1206,29 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::max<u32>(500u, options.connect_timeout_ms)));
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, options.verify_tls_peer ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, options.verify_tls_peer ? 2L : 0L);
+    if (!options.user_agent.empty() && is_safe_header_token(options.user_agent.as_ref())) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, options.user_agent.c_str());
+    }
+
+    struct curl_slist* header_list = nullptr;
+    for (usize i = 0; i < options.headers.size(); ++i) {
+        const auto& h = options.headers[i];
+        if (!h.name.empty() && is_safe_header_token(h.name.as_ref()) && is_safe_header_token(h.value.as_ref())) {
+            String combined = String::with_capacity(h.name.size() + 2 + h.value.size());
+            combined.append(h.name.as_ref());
+            combined.append(": ");
+            combined.append(h.value.as_ref());
+            header_list = curl_slist_append(header_list, combined.c_str());
+        }
+    }
+    if (header_list) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+    }
 
     const CURLcode res = curl_easy_perform(curl);
+    if (header_list) {
+        curl_slist_free_all(header_list);
+    }
     if (res != CURLE_OK) {
         std::lock_guard<std::mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
@@ -1212,6 +1240,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     {
         std::lock_guard<std::mutex> lk(m_impl->mutex);
         m_impl->curl = curl;
+        m_impl->read_timeout_ms = keel::max<u32>(500u, options.connect_timeout_ms);
         m_impl->state = WebSocketState::Connected;
     }
     return true;
@@ -1356,41 +1385,49 @@ bool WebSocketClient::receive(WebSocketMessage& out_message) {
     return true;
 
 #elif defined(KEEL_HTTP_HAS_CURL) && (LIBCURL_VERSION_NUM >= 0x075600)
-    CURL* curl = nullptr;
-    usize max_bytes = 0;
-    {
+    const auto deadline = std::chrono::steady_clock::now() + [&]() {
         std::lock_guard<std::mutex> lk(m_impl->mutex);
-        if (m_impl->state != WebSocketState::Connected || !m_impl->curl) return false;
-        curl = m_impl->curl;
-        max_bytes = m_impl->max_message_bytes;
-    }
+        return std::chrono::milliseconds(m_impl->read_timeout_ms);
+    }();
 
     u8 chunk[8192];
     for (;;) {
         size_t rlen = 0;
         const struct curl_ws_frame* meta = nullptr;
-        const CURLcode res = curl_ws_recv(curl, chunk, sizeof(chunk), &rlen, &meta);
+        CURLcode res = CURLE_OK;
+        usize max_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_impl->mutex);
+            if (m_impl->state != WebSocketState::Connected || !m_impl->curl) return false;
+            max_bytes = m_impl->max_message_bytes;
+            res = curl_ws_recv(m_impl->curl, chunk, sizeof(chunk), &rlen, &meta);
+            if (res != CURLE_OK && res != CURLE_AGAIN) {
+                m_impl->state = WebSocketState::Error;
+                m_impl->last_error = String::from(curl_easy_strerror(res));
+                return false;
+            }
+            if (res == CURLE_OK && !meta) {
+                m_impl->state = WebSocketState::Error;
+                m_impl->last_error = String::from("WebSocket frame metadata missing");
+                return false;
+            }
+            if (res == CURLE_OK && (meta->flags & CURLWS_CLOSE)) {
+                out_message.type = WebSocketFrameType::Close;
+                m_impl->state = WebSocketState::Disconnected;
+                return true;
+            }
+            if (res == CURLE_OK && out_message.data.size() + rlen > max_bytes) {
+                m_impl->state = WebSocketState::Error;
+                m_impl->last_error = String::from("WebSocket message exceeded max_message_bytes");
+                return false;
+            }
+        }
         if (res == CURLE_AGAIN) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
-        }
-        if (res != CURLE_OK || !meta) {
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
-            m_impl->state = WebSocketState::Error;
-            m_impl->last_error = String::from(curl_easy_strerror(res));
-            return false;
-        }
-        if (meta->flags & CURLWS_CLOSE) {
-            out_message.type = WebSocketFrameType::Close;
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
-            m_impl->state = WebSocketState::Disconnected;
-            return true;
-        }
-        if (out_message.data.size() + rlen > max_bytes) {
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
-            m_impl->state = WebSocketState::Error;
-            m_impl->last_error = String::from("WebSocket message exceeded max_message_bytes");
-            return false;
         }
         out_message.data.append(ArrayRef<u8>(chunk, rlen));
         if (meta->bytesleft == 0 && !(meta->flags & CURLWS_CONT)) {
