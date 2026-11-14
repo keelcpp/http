@@ -1,7 +1,7 @@
 # Verifies that all public keel_http headers:
-# 1. Only contain `#include <cstddef>`, `#include <cstdint>`, or `#include <new>` as angle-bracket includes.
+# 1. Only contain `#include <cstddef>`, `#include <cstdint>`, `#include <initializer_list>`, or `#include <new>` as angle-bracket includes.
 # 2. When compiled standalone with `/showIncludes` (MSVC) or `-H` (Clang/GCC), do not transitively include
-#    any system header outside the exact baseline of `<cstddef> + <cstdint> + <new>`.
+#    any system header outside the exact baseline of `<cstddef> + <cstdint> + <initializer_list> + <new>`.
 
 if(NOT DEFINED KEEL_HTTP_INCLUDE_DIR)
     message(FATAL_ERROR "KEEL_HTTP_INCLUDE_DIR must be passed to CheckHeaderPurity.cmake")
@@ -9,7 +9,7 @@ endif()
 
 file(GLOB KEEL_HTTP_PUBLIC_HEADERS "${KEEL_HTTP_INCLUDE_DIR}/keel/*.h" "${KEEL_HTTP_INCLUDE_DIR}/keel/*.hpp")
 
-set(ALLOWED_STD_HEADERS "cstddef" "cstdint" "new")
+set(ALLOWED_STD_HEADERS "cstddef" "cstdint" "initializer_list" "new")
 
 foreach(HDR IN LISTS KEEL_HTTP_PUBLIC_HEADERS)
     get_filename_component(HDR_NAME "${HDR}" NAME)
@@ -60,7 +60,7 @@ if(DEFINED COMPILER_PATH AND EXISTS "${COMPILER_PATH}")
     endif()
 
     set(BASELINE_SRC "${SCRATCH_DIR}/baseline.cpp")
-    file(WRITE "${BASELINE_SRC}" "#include <cstddef>\n#include <cstdint>\n#include <new>\nint main() { return 0; }\n")
+    file(WRITE "${BASELINE_SRC}" "#include <cstddef>\n#include <cstdint>\n#include <initializer_list>\n#include <new>\nint main() { return 0; }\n")
 
     if(COMPILER_ID MATCHES "MSVC")
         execute_process(
