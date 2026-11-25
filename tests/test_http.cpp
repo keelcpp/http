@@ -1,15 +1,13 @@
 #include "keel/http.h"
 #include "keel/format.h"
 
-#include <cstdlib>
-
 namespace {
 
-int g_failures = 0;
+keel::i32 g_failures = 0;
 
-void check_impl(bool cond, const char* expr, const char* file, int line) {
+void check_impl(bool cond, const char* expr, const char* file, keel::i32 line) {
     if (!cond) {
-        keel::eprintln("[FAIL] %s:%d: %s", file, line, expr);
+        keel::eprintln("[FAIL] {}:{}: {}", file, line, expr);
         ++g_failures;
     }
 }
@@ -130,8 +128,8 @@ int main() {
 
     if (g_failures == 0) {
         keel::println("All keel_http tests passed.");
-        return EXIT_SUCCESS;
+        return 0;
     }
-    keel::eprintln("%d test(s) failed.", g_failures);
-    return EXIT_FAILURE;
+    keel::eprintln("{} test(s) failed.", g_failures);
+    return 1;
 }

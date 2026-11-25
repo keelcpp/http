@@ -62,6 +62,18 @@ else()
     endif()
 endif()
 
+if(COMMAND keel_enforce_guidelines)
+    keel_enforce_guidelines(keel_http
+        SCOPE HEADERS_ONLY
+        BAN_RAW_INTS ALL
+        BAN_RAW_FLOATS ALL
+        HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        STANDALONE_HEADERS ${KEEL_HTTP_BUILD_TESTS}
+        TEST_NAME test_guidelines_headers
+        WARNINGS OFF
+    )
+endif()
+
 # Install & package support (`find_package(keel_http)`)
 include(CMakePackageConfigHelpers)
 install(TARGETS keel_http EXPORT keel_httpTargets
@@ -100,6 +112,14 @@ if( KEEL_HTTP_BUILD_TESTS )
         target_compile_options(test_http PRIVATE /W4 /utf-8)
     else()
         target_compile_options(test_http PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    if(COMMAND keel_enforce_guidelines)
+        keel_enforce_guidelines(test_http
+            SCOPE ALL
+            BAN_RAW_INTS ALL
+            BAN_RAW_FLOATS ALL
+            WARNINGS OFF
+        )
     endif()
 
     add_test(NAME test_http COMMAND test_http)
