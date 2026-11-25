@@ -92,6 +92,10 @@ void test_url_parser_and_encoding() {
         CHECK(!keel::parse_url("http://example.com:0/").valid);
         CHECK(!keel::parse_url("http://example.com:70000/").valid);
         CHECK(!keel::parse_url("http://[::1/bad").valid);
+        // Reject embedded control characters (CRLF/NUL/TAB injection defense).
+        CHECK(!keel::parse_url("http://example.com/a\r\nX-Evil: 1").valid);
+        CHECK(!keel::parse_url("http://example.com/a\nb").valid);
+        CHECK(!keel::parse_url(keel::StringRef("http://example.com/a\0b", 22)).valid);
     }
 
     // Percent-encoding & decoding.
@@ -204,15 +208,36 @@ void test_cookie_jar() {
     const keel::String other_sub = jar.cookie_header_for("https://other.example.com/");
     CHECK(other_sub == "shared=1");
 
-    // Max-Age=0 deletes cookie.
+    // Max-Age=0 deletes cookie (and takes precedence over future Expires per RFC 6265 §5.3).
     keel::SmallArray<keel::HttpHeader, 4> del_hdrs;
     del_hdrs.push_back(keel::HttpHeader{
         .name = keel::String::from("Set-Cookie"),
-        .value = keel::String::from("sid=; Path=/; Max-Age=0")
+        .value = keel::String::from("sid=; Path=/; Expires=Wed, 21 Oct 2099 07:28:00 GMT; Max-Age=0")
     });
     jar.store_from_headers("https://sub.example.com/api/logout", keel::ArrayRef<keel::HttpHeader>(del_hdrs));
     CHECK(jar.size() == 2);
     CHECK(!jar.cookie_header_for("https://sub.example.com/").as_ref().contains("sid="));
+
+    // Future Expires stores cookie; path boundary /api must NOT match /apiv2.
+    keel::SmallArray<keel::HttpHeader, 4> edge_hdrs;
+    edge_hdrs.push_back(keel::HttpHeader{
+        .name = keel::String::from("Set-Cookie"),
+        .value = keel::String::from("fut=ok; Path=/api; Expires=Wed, 21 Oct 2099 07:28:00 GMT")
+    });
+    jar.store_from_headers("https://sub.example.com/api/v1", keel::ArrayRef<keel::HttpHeader>(edge_hdrs));
+    CHECK(jar.cookie_header_for("https://sub.example.com/api").as_ref().contains("fut=ok"));
+    CHECK(jar.cookie_header_for("https://sub.example.com/api/items").as_ref().contains("fut=ok"));
+    CHECK(!jar.cookie_header_for("https://sub.example.com/apiv2").as_ref().contains("fut=ok"));
+
+    // RFC 6265 §5.1.3: IP literal must reject domain-suffix cookie attributes.
+    keel::CookieJar ip_jar;
+    keel::SmallArray<keel::HttpHeader, 2> ip_hdrs;
+    ip_hdrs.push_back(keel::HttpHeader{
+        .name = keel::String::from("Set-Cookie"),
+        .value = keel::String::from("bad=1; Domain=0.0.1; Path=/")
+    });
+    ip_jar.store_from_headers("http://127.0.0.1:8080/", keel::ArrayRef<keel::HttpHeader>(ip_hdrs));
+    CHECK(ip_jar.size() == 0);
 }
 
 void test_http_types_and_mock() {
@@ -255,7 +280,12 @@ void test_clients_lifecycle() {
 // ============================================================================
 // Live Loopback Integration Suite (driven by tests/verify_integration.py)
 // ============================================================================
-keel::i32 run_integration_suite(keel::StringRef base_url, keel::StringRef temp_dir) {
+keel::i32 run_integration_suite(
+    keel::StringRef base_url,
+    keel::StringRef ws_url,
+    keel::StringRef closed_url,
+    keel::StringRef temp_dir
+) {
     keel::HttpClient client("keel-integration/0.2");
 
     auto url_of = [&base_url](keel::StringRef path) -> keel::String {
@@ -368,6 +398,28 @@ keel::i32 run_integration_suite(keel::StringRef base_url, keel::StringRef temp_d
         CHECK(r307.body_as_text().contains("METHOD=POST"));
         CHECK(r307.body_as_text().contains("BODY=secret-post-body"));
 
+        // 303 on PUT must downgrade to GET and drop body.
+        const auto r303 = client.put(
+            url_of("/redirect/303-put"),
+            keel::ArrayRef<keel::u8>(reinterpret_cast<const keel::u8*>(pbody.data()), pbody.size()),
+            "text/plain", {}, 5000
+        );
+        CHECK(r303.succeeded());
+        CHECK(r303.redirect_count == 1);
+        CHECK(r303.body_as_text().contains("METHOD=GET"));
+        CHECK(!r303.body_as_text().contains("secret-post-body"));
+
+        // 308 on POST must preserve POST and body.
+        const auto r308 = client.post(
+            url_of("/redirect/308-post"),
+            keel::ArrayRef<keel::u8>(reinterpret_cast<const keel::u8*>(pbody.data()), pbody.size()),
+            "text/plain", {}, 5000
+        );
+        CHECK(r308.succeeded());
+        CHECK(r308.redirect_count == 1);
+        CHECK(r308.body_as_text().contains("METHOD=POST"));
+        CHECK(r308.body_as_text().contains("BODY=secret-post-body"));
+
         // Redirect loop exceeds max_redirects.
         keel::HttpRequest loop_req{};
         loop_req.url = url_of("/redirect/loop");
@@ -420,10 +472,19 @@ keel::i32 run_integration_suite(keel::StringRef base_url, keel::StringRef temp_d
         const auto after = client.get(url_of("/cookie/profile"), {}, 5000);
         CHECK(after.succeeded());
         CHECK(!after.body_as_text().contains("keel_session_42"));
+
+        // Cross-host CookieJar isolation: host-only cookie on 127.0.0.1 must NOT be sent to localhost!
+        const auto login2 = client.get(url_of("/cookie/login"), {}, 5000);
+        CHECK(login2.succeeded() && jar.size() == 1);
+        const auto xhost = client.get(url_of("/redirect/cross-host"), {}, 5000);
+        CHECK(xhost.succeeded());
+        CHECK(xhost.redirect_count == 1);
+        CHECK(!xhost.body_as_text().contains("keel_session_42"));
         client.set_cookie_jar(nullptr);
     }
 
-    // 6. Retry policy (503 x2 -> 200, and 429 Retry-After: 0 -> 200).
+    // 6. Retry policy (503 x2 -> 200, 429 Retry-After -> 200, POST non-idempotent guard,
+    //    network-error retry, streaming+redirect & streaming+retry body suppression).
     {
         keel::HttpRequest req503{};
         req503.url = url_of("/retry/flaky503");
@@ -444,6 +505,61 @@ keel::i32 run_integration_suite(keel::StringRef base_url, keel::StringRef temp_d
         CHECK(r429.succeeded());
         CHECK(r429.attempts == 2);
         CHECK(r429.body_as_text() == "recovered-429");
+
+        // POST is NOT retried when retry_non_idempotent == false (default), IS retried when true.
+        keel::HttpRequest post_no_retry{};
+        post_no_retry.url = url_of("/retry/post503");
+        post_no_retry.method = keel::HttpMethod::Post;
+        post_no_retry.retry.max_retries = 2;
+        post_no_retry.retry.initial_delay_ms = 10;
+        const auto pnr = client.execute(post_no_retry);
+        CHECK(pnr.status_code == 503);
+        CHECK(pnr.attempts == 1);
+
+        keel::HttpRequest post_yes_retry = keel::move(post_no_retry);
+        post_yes_retry.retry.retry_non_idempotent = true;
+        const auto pyr = client.execute(post_yes_retry);
+        CHECK(pyr.succeeded());
+        CHECK(pyr.attempts == 2);
+        CHECK(pyr.body_as_text() == "post-recovered");
+
+        // Network-error retry against closed loopback port.
+        keel::HttpRequest net_req{};
+        net_req.url = keel::String::from(closed_url);
+        net_req.connect_timeout_ms = 500;
+        net_req.read_timeout_ms = 500;
+        net_req.retry.max_retries = 2;
+        net_req.retry.initial_delay_ms = 10;
+        net_req.retry.max_delay_ms = 50;
+        const auto net_r = client.execute(net_req);
+        CHECK(!net_r.succeeded());
+        CHECK(net_r.attempts == 3);
+
+        // execute_streaming must NOT emit intermediate 302 redirect body into on_chunk!
+        keel::HttpRequest sr_redir{};
+        sr_redir.url = url_of("/redirect/sub/rel");
+        keel::String stream_redir_text;
+        const auto sr_r = client.execute_streaming(sr_redir, [&](keel::ArrayRef<keel::u8> c) -> bool {
+            stream_redir_text.append(keel::StringRef(reinterpret_cast<const char*>(c.data()), c.size()));
+            return true;
+        });
+        CHECK(sr_r.succeeded());
+        CHECK(sr_r.redirect_count == 1);
+        CHECK(stream_redir_text == "redirect-target-ok");
+
+        // execute_streaming must NOT emit 503 error bodies on retries into on_chunk!
+        keel::HttpRequest sr_retry{};
+        sr_retry.url = url_of("/retry/stream503");
+        sr_retry.retry.max_retries = 3;
+        sr_retry.retry.initial_delay_ms = 15;
+        keel::String stream_retry_text;
+        const auto sr_t = client.execute_streaming(sr_retry, [&](keel::ArrayRef<keel::u8> c) -> bool {
+            stream_retry_text.append(keel::StringRef(reinterpret_cast<const char*>(c.data()), c.size()));
+            return true;
+        });
+        CHECK(sr_t.succeeded());
+        CHECK(sr_t.attempts == 3);
+        CHECK(stream_retry_text == "stream-recovered");
     }
 
     // 7. Streaming download, early abort, max_response_bytes cap, download_to_file.
@@ -525,6 +641,41 @@ keel::i32 run_integration_suite(keel::StringRef base_url, keel::StringRef temp_d
         CHECK(!tr.error_message.empty());
     }
 
+    // 9. Live RFC 6455 WebSocket handshake, text echo, binary echo (>125 bytes), and close.
+    {
+        keel::WebSocketClient ws;
+        keel::WebSocketConnectOptions opts{};
+        opts.connect_timeout_ms = 5000;
+        CHECK(ws.connect(ws_url, opts));
+        CHECK(ws.state() == keel::WebSocketState::Connected);
+
+        CHECK(ws.send_text("hello websocket keel"));
+        keel::WebSocketMessage msg{};
+        CHECK(ws.receive(msg));
+        CHECK(msg.type == keel::WebSocketFrameType::Text);
+        CHECK(msg.as_text() == "hello websocket keel");
+
+        // Binary message of 512 bytes (exercises 16-bit extended RFC 6455 payload length + NULs).
+        keel::Array<keel::u8> bin;
+        bin.reserve(512);
+        for (keel::u32 i = 0; i < 512u; ++i) {
+            bin.push_back(keel::as<keel::u8>((i * 73u + 19u) & 0xFFu));
+        }
+        CHECK(ws.send_binary(keel::ArrayRef<keel::u8>(bin)));
+        keel::WebSocketMessage bmsg{};
+        CHECK(ws.receive(bmsg));
+        CHECK(bmsg.type == keel::WebSocketFrameType::Binary);
+        CHECK(bmsg.data.size() == bin.size());
+        bool bin_ok = (bmsg.data.size() == bin.size());
+        for (keel::usize i = 0; bin_ok && i < bin.size(); ++i) {
+            if (bmsg.data[i] != bin[i]) bin_ok = false;
+        }
+        CHECK(bin_ok);
+
+        ws.close(1000, "done");
+        CHECK(ws.state() == keel::WebSocketState::Disconnected);
+    }
+
     if (g_failures == 0) {
         keel::println("All keel_http integration tests passed.");
         return 0;
@@ -536,8 +687,13 @@ keel::i32 run_integration_suite(keel::StringRef base_url, keel::StringRef temp_d
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 4 && keel::StringRef(argv[1]) == "--integration") {
-        return run_integration_suite(keel::StringRef(argv[2]), keel::StringRef(argv[3]));
+    if (argc == 6 && keel::StringRef(argv[1]) == "--integration") {
+        return run_integration_suite(
+            keel::StringRef(argv[2]),
+            keel::StringRef(argv[3]),
+            keel::StringRef(argv[4]),
+            keel::StringRef(argv[5])
+        );
     }
     if (argc == 4 && keel::StringRef(argv[1]) == "--resolve-url") {
         keel::println("{}", keel::resolve_url(keel::StringRef(argv[2]), keel::StringRef(argv[3])));

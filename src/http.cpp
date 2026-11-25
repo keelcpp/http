@@ -321,9 +321,37 @@ constexpr char kBase64Alphabet[64] = {
     );
 }
 
+[[nodiscard]] bool is_ip_literal(StringRef host) noexcept {
+    if (host.empty()) return false;
+    // IPv6 literal (unbracketed in ParsedUrl::host) always contains ':'.
+    if (host.contains(':')) return true;
+    // IPv4 literal: 4 dot-separated decimal octets 0..255.
+    usize dots = 0;
+    usize seg_len = 0;
+    u32 val = 0;
+    for (usize i = 0; i < host.size(); ++i) {
+        const char c = host[i];
+        if (c == '.') {
+            if (seg_len == 0 || val > 255u) return false;
+            ++dots;
+            seg_len = 0;
+            val = 0;
+        } else if (c >= '0' && c <= '9') {
+            val = val * 10u + as<u32>(c - '0');
+            ++seg_len;
+            if (seg_len > 3u || val > 255u) return false;
+        } else {
+            return false;
+        }
+    }
+    return dots == 3u && seg_len > 0 && val <= 255u;
+}
+
 [[nodiscard]] bool domain_matches(StringRef req_host_lower, StringRef cookie_domain_lower, bool host_only) noexcept {
     if (req_host_lower == cookie_domain_lower) return true;
     if (host_only) return false;
+    // RFC 6265 §5.1.3: domain-suffix matching does not apply to IP address literals.
+    if (is_ip_literal(req_host_lower)) return false;
     if (req_host_lower.size() <= cookie_domain_lower.size()) return false;
     if (!req_host_lower.ends_with(cookie_domain_lower)) return false;
     return req_host_lower[req_host_lower.size() - cookie_domain_lower.size() - 1] == '.';
@@ -542,6 +570,12 @@ ParsedUrl parse_url(StringRef url) {
     ParsedUrl result{};
     url = trim_ascii(url);
     if (url.empty()) return result;
+
+    // Reject ASCII control characters (including CR, LF, NUL, TAB) to prevent request-line/header injection.
+    for (usize i = 0; i < url.size(); ++i) {
+        const u8 b = as<u8>(url[i]);
+        if (b < 0x20u || b == 0x7Fu) return result;
+    }
 
     const usize scheme_sep = url.find("://");
     if (scheme_sep == StringRef::npos || scheme_sep == 0 || scheme_sep >= 15) {
@@ -1918,8 +1952,13 @@ HttpResponse HttpClient::execute_internal(
         curl_easy_setopt(curl, CURLOPT_URL, url_copy.c_str());
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::max<u32>(100u, request.connect_timeout_ms))); // keel-lint: ignore
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(keel::max<u32>(100u, request.connect_timeout_ms + request.read_timeout_ms))); // keel-lint: ignore
+        const u64 conn_ms = keel::max<u64>(100ULL, as<u64>(request.connect_timeout_ms));
+        const u64 total_ms = keel::min<u64>(
+            as<u64>(Limits<i32>::kMax),
+            keel::max<u64>(100ULL, as<u64>(request.connect_timeout_ms) + as<u64>(request.read_timeout_ms))
+        );
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::min<u64>(conn_ms, as<u64>(Limits<i32>::kMax)))); // keel-lint: ignore
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(total_ms)); // keel-lint: ignore
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, request.verify_tls_peer ? 1L : 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, request.verify_tls_peer ? 2L : 0L);

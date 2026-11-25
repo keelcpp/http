@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-End-to-end HTTP integration & differential verification suite for keel::http.
+End-to-end HTTP + WebSocket integration & differential verification suite for keel::http.
 
-Spins up two ephemeral-port local ThreadingHTTPServer instances on 127.0.0.1
-(primary + secondary origin for cross-origin redirect security tests) and runs
-test_http --integration against them, plus RFC 3986 resolve_url differential
-checks against Python's urllib.parse.urljoin.
+Spins up:
+  1. Primary local ThreadingHTTPServer on 127.0.0.1 (all HTTP verbs, forms, multipart,
+     redirects, CookieJar, retries, streaming, timeout).
+  2. Secondary local ThreadingHTTPServer (cross-origin & cross-host security tests).
+  3. Minimal RFC 6455 WebSocket echo server on 127.0.0.1 (handshake, text, binary, close).
+  4. An unused/closed ephemeral port (network-error retry tests).
 
 Usage:
     python tests/verify_integration.py [path/to/test_http.exe]
 """
 
+import base64
 import email.parser
 import email.policy
+import hashlib
 import http.server
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import urllib.parse
 from pathlib import Path
 
@@ -47,6 +52,8 @@ class SharedState:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.flaky503_hits = 0
+        self.stream503_hits = 0
+        self.post503_hits = 0
         self.rate429_hits = 0
         self.secondary_port = 0
 
@@ -111,6 +118,9 @@ def make_handler(state: SharedState, is_secondary: bool = False):
             elif p == "/redirect/cross-origin":
                 target = f"http://127.0.0.1:{state.secondary_port}/cross-landed"
                 self._send(302, b"moving", headers=[("Location", target)])
+            elif p == "/redirect/cross-host":
+                target = f"http://localhost:{state.secondary_port}/cross-host-landed"
+                self._send(302, b"moving-host", headers=[("Location", target)])
             elif p == "/cookie/login":
                 self._send(
                     302,
@@ -143,6 +153,14 @@ def make_handler(state: SharedState, is_secondary: bool = False):
                     self._send(503, b"temporarily unavailable")
                 else:
                     self._send(200, b"recovered-503")
+            elif p == "/retry/stream503":
+                with state.lock:
+                    state.stream503_hits += 1
+                    hit = state.stream503_hits
+                if hit <= 2:
+                    self._send(503, b"SHOULD_NOT_STREAM_ERROR_BODY")
+                else:
+                    self._send(200, b"stream-recovered")
             elif p == "/retry/rate429":
                 with state.lock:
                     state.rate429_hits += 1
@@ -193,12 +211,26 @@ def make_handler(state: SharedState, is_secondary: bool = False):
                 self._send(302, b"see-echo", headers=[("Location", "/echo")])
             elif p == "/redirect/307-post":
                 self._send(307, b"preserve-post", headers=[("Location", "/echo")])
+            elif p == "/redirect/308-post":
+                self._send(308, b"preserve-post-308", headers=[("Location", "/echo")])
+            elif p == "/retry/post503":
+                with state.lock:
+                    state.post503_hits += 1
+                    hit = state.post503_hits
+                if hit <= 2:
+                    self._send(503, b"post-busy")
+                else:
+                    self._send(200, b"post-recovered")
             else:
                 self._send(404, b"not found")
 
         def do_PUT(self):
             body = self._read_body()
-            self._send(200, self._echo_info("PUT", body))
+            p = urllib.parse.urlsplit(self.path).path
+            if p == "/redirect/303-put":
+                self._send(303, b"see-other", headers=[("Location", "/echo")])
+            else:
+                self._send(200, self._echo_info("PUT", body))
 
         def do_PATCH(self):
             body = self._read_body()
@@ -209,6 +241,106 @@ def make_handler(state: SharedState, is_secondary: bool = False):
             self._send(200, self._echo_info("DELETE", body))
 
     return TestHandler
+
+
+class QuietHTTPServer(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Ignore expected ConnectionResetError / BrokenPipeError from abort & timeout tests.
+        pass
+
+
+def recv_exact(conn: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("socket closed")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def send_ws_frame(conn: socket.socket, opcode: int, payload: bytes) -> None:
+    hdr = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        hdr.append(n)
+    elif n < 65536:
+        hdr.append(126)
+        hdr.extend(struct.pack(">H", n))
+    else:
+        hdr.append(127)
+        hdr.extend(struct.pack(">Q", n))
+    conn.sendall(bytes(hdr) + payload)
+
+
+def run_ws_echo_server(sock: socket.socket, stop_event: threading.Event) -> None:
+    sock.settimeout(0.2)
+    while not stop_event.is_set():
+        try:
+            conn, _ = sock.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            conn.settimeout(5.0)
+            req_buf = bytearray()
+            while b"\r\n\r\n" not in req_buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                req_buf.extend(chunk)
+            ws_key = ""
+            for line in req_buf.decode("iso-8859-1").split("\r\n"):
+                if line.lower().startswith("sec-websocket-key:"):
+                    ws_key = line.split(":", 1)[1].strip()
+                    break
+            if not ws_key:
+                conn.close()
+                continue
+            accept = base64.b64encode(
+                hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+            ).decode("ascii")
+            resp = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("ascii")
+            conn.sendall(resp)
+
+            while not stop_event.is_set():
+                b0, b1 = recv_exact(conn, 2)
+                opcode = b0 & 0x0F
+                masked = (b1 & 0x80) != 0
+                plen = b1 & 0x7F
+                if plen == 126:
+                    plen = struct.unpack(">H", recv_exact(conn, 2))[0]
+                elif plen == 127:
+                    plen = struct.unpack(">Q", recv_exact(conn, 8))[0]
+                mask = recv_exact(conn, 4) if masked else b"\x00\x00\x00\x00"
+                raw = recv_exact(conn, plen)
+                payload = bytes(raw[i] ^ mask[i & 3] for i in range(plen)) if masked else raw
+                if opcode == 0x8:
+                    send_ws_frame(conn, 0x8, struct.pack(">H", 1000))
+                    break
+                if opcode in (0x1, 0x2):
+                    send_ws_frame(conn, opcode, payload)
+        except (OSError, EOFError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def pick_closed_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def verify_resolve_url_differential(exe: Path) -> int:
@@ -232,12 +364,6 @@ def verify_resolve_url_differential(exe: Path) -> int:
     return failures
 
 
-class QuietHTTPServer(http.server.ThreadingHTTPServer):
-    def handle_error(self, request, client_address):
-        # Ignore expected ConnectionResetError / BrokenPipeError from abort & timeout tests.
-        pass
-
-
 def main() -> int:
     exe = find_exe()
 
@@ -251,16 +377,28 @@ def main() -> int:
     primary = QuietHTTPServer(("127.0.0.1", 0), make_handler(state, is_secondary=False))
     primary_port = primary.server_address[1]
 
+    ws_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ws_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ws_sock.bind(("127.0.0.1", 0))
+    ws_sock.listen(4)
+    ws_port = ws_sock.getsockname()[1]
+
+    closed_port = pick_closed_port()
+
     t1 = threading.Thread(target=primary.serve_forever, daemon=True)
     t2 = threading.Thread(target=secondary.serve_forever, daemon=True)
+    t3 = threading.Thread(target=run_ws_echo_server, args=(ws_sock, state.stop_event), daemon=True)
     t1.start()
     t2.start()
+    t3.start()
 
     try:
         with tempfile.TemporaryDirectory(prefix="keel_http_it_") as tmpdir:
             base_url = f"http://127.0.0.1:{primary_port}"
+            ws_url = f"ws://127.0.0.1:{ws_port}/ws"
+            closed_url = f"http://127.0.0.1:{closed_port}/unreachable"
             proc = subprocess.run(
-                [str(exe), "--integration", base_url, tmpdir],
+                [str(exe), "--integration", base_url, ws_url, closed_url, tmpdir],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -275,12 +413,16 @@ def main() -> int:
                 return 1
     finally:
         state.stop_event.set()
+        try:
+            ws_sock.close()
+        except OSError:
+            pass
         primary.shutdown()
         secondary.shutdown()
         primary.server_close()
         secondary.server_close()
 
-    print("verify_integration: ALL live HTTP integration & RFC 3986 differential checks PASSED")
+    print("verify_integration: ALL live HTTP + WebSocket integration & RFC 3986 differential checks PASSED")
     return 0
 
 
