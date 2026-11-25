@@ -64,7 +64,7 @@ endif()
 
 if(COMMAND keel_enforce_guidelines)
     keel_enforce_guidelines(keel_http
-        SCOPE HEADERS_ONLY
+        SCOPE ALL
         BAN_RAW_INTS ALL
         BAN_RAW_FLOATS ALL
         HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include"

@@ -1,12 +1,10 @@
 #include "keel/http.h"
 #include "keel/format.h"
+#include "keel/memory.h"
 #include "keel/number.h"
 #include "keel/ring.h"
-
-#include <chrono>
-#include <cstring>
-#include <mutex>
-#include <thread>
+#include "keel/sync.h"
+#include "keel/time.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -137,17 +135,17 @@ struct WideBuffer {
 
     void append_utf8(StringRef utf8) {
         if (utf8.empty()) return;
-        const int needed = MultiByteToWideChar(
-            CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+        const i32 needed = MultiByteToWideChar(
+            CP_UTF8, 0, utf8.data(), as<i32>(utf8.size()), nullptr, 0);
         if (needed <= 0) return;
         if (!chars.empty() && chars.back() == L'\0') {
             chars.pop_back();
         }
         const usize old_len = chars.size();
-        chars.resize(old_len + static_cast<usize>(needed) + 1, L'\0');
+        chars.resize(old_len + as<usize>(needed) + 1, L'\0');
         MultiByteToWideChar(
-            CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), chars.data() + old_len, needed);
-        chars[old_len + static_cast<usize>(needed)] = L'\0';
+            CP_UTF8, 0, utf8.data(), as<i32>(utf8.size()), chars.data() + old_len, needed);
+        chars[old_len + as<usize>(needed)] = L'\0';
     }
 
     void append_literal(const wchar_t* lit) {
@@ -182,13 +180,13 @@ struct WideBuffer {
 
 [[nodiscard]] String wide_to_utf8(const wchar_t* wide, usize wide_len) {
     if (!wide || wide_len == 0) return String{};
-    const int needed = WideCharToMultiByte(
-        CP_UTF8, 0, wide, static_cast<int>(wide_len), nullptr, 0, nullptr, nullptr);
+    const i32 needed = WideCharToMultiByte(
+        CP_UTF8, 0, wide, as<i32>(wide_len), nullptr, 0, nullptr, nullptr);
     if (needed <= 0) return String{};
     Array<char> tmp;
-    tmp.resize(static_cast<usize>(needed));
+    tmp.resize(as<usize>(needed));
     WideCharToMultiByte(
-        CP_UTF8, 0, wide, static_cast<int>(wide_len), tmp.data(), needed, nullptr, nullptr);
+        CP_UTF8, 0, wide, as<i32>(wide_len), tmp.data(), needed, nullptr, nullptr);
     return String::from(StringRef(tmp.data(), tmp.size()));
 }
 
@@ -443,18 +441,18 @@ struct HttpClient::Impl {
     }
 
 #elif defined(KEEL_HTTP_HAS_CURL)
-    mutable std::mutex pool_mutex{};
+    mutable Mutex pool_mutex{};
     mutable SmallArray<CURL*, 16> handle_pool{};
 
     explicit Impl(StringRef ua) : default_user_agent(String::from(ua.empty() ? StringRef("keel-http/0.1") : ua)) {
-        static std::once_flag s_curl_init_flag;
-        std::call_once(s_curl_init_flag, []() {
+        static OnceFlag s_curl_init_flag;
+        call_once(s_curl_init_flag, []() {
             curl_global_init(CURL_GLOBAL_DEFAULT);
         });
     }
 
     ~Impl() {
-        std::lock_guard<std::mutex> lk(pool_mutex);
+        LockGuard<Mutex> lk(pool_mutex);
         for (usize i = 0; i < handle_pool.size(); ++i) {
             if (handle_pool[i]) curl_easy_cleanup(handle_pool[i]);
         }
@@ -463,7 +461,7 @@ struct HttpClient::Impl {
 
     [[nodiscard]] CURL* acquire_handle() const {
         {
-            std::lock_guard<std::mutex> lk(pool_mutex);
+            LockGuard<Mutex> lk(pool_mutex);
             if (!handle_pool.empty()) {
                 CURL* h = handle_pool.back();
                 handle_pool.pop_back();
@@ -476,7 +474,7 @@ struct HttpClient::Impl {
 
     void release_handle(CURL* h) const noexcept {
         if (!h) return;
-        std::lock_guard<std::mutex> lk(pool_mutex);
+        LockGuard<Mutex> lk(pool_mutex);
         if (handle_pool.size() < 16) {
             handle_pool.push_back(h);
         } else {
@@ -574,7 +572,7 @@ HttpResponse HttpClient::post(
 }
 
 HttpResponse HttpClient::execute(const HttpRequest& request) const {
-    const auto t0 = std::chrono::steady_clock::now();
+    const u64 t0_ns = monotonic_ns();
     HttpResponse response{};
 
     const ParsedUrl parsed = parse_url(request.url.as_ref());
@@ -617,8 +615,8 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
         return response;
     }
 
-    const int conn_timeout = static_cast<int>(keel::max<u32>(100u, request.connect_timeout_ms));
-    const int io_timeout = static_cast<int>(keel::max<u32>(100u, request.read_timeout_ms));
+    const i32 conn_timeout = as<i32>(keel::max<u32>(100u, request.connect_timeout_ms));
+    const i32 io_timeout = as<i32>(keel::max<u32>(100u, request.read_timeout_ms));
     WinHttpSetTimeouts(h_request.get(), conn_timeout, conn_timeout, io_timeout, io_timeout);
 
     if (!request.follow_redirects) {
@@ -710,7 +708,10 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
 #elif defined(__EMSCRIPTEN__)
     emscripten_fetch_attr_t attr;
     emscripten_fetch_attr_init(&attr);
-    std::strncpy(attr.requestMethod, http_method_to_cstr(request.method), sizeof(attr.requestMethod) - 1);
+    const StringRef m_str = http_method_to_cstr(request.method);
+    const usize m_len = keel::min<usize>(m_str.size(), sizeof(attr.requestMethod) - 1u);
+    mem_copy(attr.requestMethod, m_str.data(), m_len);
+    attr.requestMethod[m_len] = '\0';
     attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
     attr.timeoutMSecs = keel::max<u32>(request.connect_timeout_ms, request.read_timeout_ms);
 
@@ -767,7 +768,7 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
         bool overflow = false;
     } write_ctx{&response.body, request.max_response_bytes, false};
 
-    auto write_cb = +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+    auto write_cb = +[](char* ptr, usize size, usize nmemb, void* userdata) -> usize {
         auto* ctx = static_cast<WriteContext*>(userdata);
         const usize total = size * nmemb;
         if (!ctx || !ctx->body) return 0;
@@ -779,7 +780,7 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
         return total;
     };
 
-    auto header_cb = +[](char* buffer, size_t size, size_t nitems, void* userdata) -> size_t {
+    auto header_cb = +[](char* buffer, usize size, usize nitems, void* userdata) -> usize {
         auto* resp = static_cast<HttpResponse*>(userdata);
         const usize total = size * nitems;
         if (!resp || total == 0) return total;
@@ -809,8 +810,8 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
     curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::max<u32>(100u, request.connect_timeout_ms)));
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(keel::max<u32>(100u, request.connect_timeout_ms + request.read_timeout_ms)));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::max<u32>(100u, request.connect_timeout_ms))); // keel-lint: ignore
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(keel::max<u32>(100u, request.connect_timeout_ms + request.read_timeout_ms))); // keel-lint: ignore
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, request.follow_redirects ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, request.verify_tls_peer ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, request.verify_tls_peer ? 2L : 0L);
@@ -832,12 +833,12 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
     } else if (request.method == HttpMethod::Post) {
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.empty() ? "" : reinterpret_cast<const char*>(request.body.data()));
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size())); // keel-lint: ignore
     } else if (request.method != HttpMethod::Get) {
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, http_method_to_cstr(request.method));
         if (!request.body.empty()) {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reinterpret_cast<const char*>(request.body.data()));
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size()));
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(request.body.size())); // keel-lint: ignore
         }
     }
 
@@ -858,7 +859,7 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
 
     const CURLcode res = curl_easy_perform(curl);
     if (res == CURLE_OK) {
-        long http_code = 0;
+        long http_code = 0; // keel-lint: ignore
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         response.status_code = static_cast<i32>(http_code);
     } else if (write_ctx.overflow) {
@@ -876,8 +877,8 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
     response.error_message = String::from("No HTTP backend compiled for this platform");
 #endif
 
-    const auto t1 = std::chrono::steady_clock::now();
-    response.elapsed_ms = std::chrono::duration<f64, std::milli>(t1 - t0).count();
+    const u64 t1_ns = monotonic_ns();
+    response.elapsed_ms = as<f64>(t1_ns - t0_ns) * 1e-6;
     return response;
 }
 
@@ -886,7 +887,7 @@ HttpResponse HttpClient::execute(const HttpRequest& request) const {
 // ============================================================================
 
 struct WebSocketClient::Impl {
-    mutable std::mutex mutex{};
+    mutable Mutex mutex{};
     WebSocketState state = WebSocketState::Disconnected;
     String last_error{};
     usize max_message_bytes = 16u * 1024u * 1024u;
@@ -958,13 +959,13 @@ WebSocketClient& WebSocketClient::operator=(WebSocketClient&& other) noexcept {
 
 WebSocketState WebSocketClient::state() const noexcept {
     if (!m_impl) return WebSocketState::Disconnected;
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     return m_impl->state;
 }
 
 String WebSocketClient::last_error() const {
     if (!m_impl) return String{};
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     return m_impl->last_error.clone();
 }
 
@@ -974,14 +975,14 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
 
     const ParsedUrl parsed = parse_url(url);
     if (!parsed.valid || !parsed.is_websocket) {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = String::from("Invalid WebSocket URL (expected ws:// or wss://)");
         return false;
     }
 
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Connecting;
         m_impl->last_error.clear();
         m_impl->max_message_bytes = options.max_message_bytes;
@@ -998,13 +999,13 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     ));
     if (!h_session) {
         const DWORD err = ::GetLastError();
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = format_winhttp_error("WinHttpOpen failed for WebSocket", err);
         return false;
     }
 
-    const int timeout_ms = static_cast<int>(keel::max<u32>(500u, options.connect_timeout_ms));
+    const i32 timeout_ms = as<i32>(keel::max<u32>(500u, options.connect_timeout_ms));
     WinHttpSetTimeouts(h_session.get(), timeout_ms, timeout_ms, timeout_ms, timeout_ms);
 
     const WideBuffer w_host = utf8_to_wide(parsed.host.as_ref());
@@ -1016,7 +1017,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     ));
     if (!h_connect) {
         const DWORD err = ::GetLastError();
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = format_winhttp_error("WinHttpConnect failed for WebSocket", err);
         return false;
@@ -1034,7 +1035,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     ));
     if (!h_request) {
         const DWORD err = ::GetLastError();
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = format_winhttp_error("WinHttpOpenRequest failed for WebSocket", err);
         return false;
@@ -1050,7 +1051,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
 
     if (!WinHttpSetOption(h_request.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)) {
         const DWORD err = ::GetLastError();
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = format_winhttp_error("WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET failed", err);
         return false;
@@ -1077,7 +1078,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
             0) ||
         !WinHttpReceiveResponse(h_request.get(), nullptr)) {
         const DWORD err = ::GetLastError();
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = format_winhttp_error("WebSocket HTTP upgrade handshake failed", err);
         return false;
@@ -1093,7 +1094,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
             &status_size,
             WINHTTP_NO_HEADER_INDEX) &&
         status_code != 101) {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         char buf[128];
         const StringRef r = format_buf(buf, "WebSocket upgrade rejected by server (HTTP %u)", static_cast<u32>(status_code));
@@ -1106,14 +1107,14 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
 
     if (!h_websocket) {
         const DWORD err = ::GetLastError();
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = format_winhttp_error("WinHttpWebSocketCompleteUpgrade failed", err);
         return false;
     }
 
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->h_session = keel::move(h_session);
         m_impl->h_connect = keel::move(h_connect);
         m_impl->h_websocket = keel::move(h_websocket);
@@ -1123,7 +1124,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
 
 #elif defined(__EMSCRIPTEN__)
     if (!emscripten_websocket_is_supported()) {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = String::from("Emscripten WebSockets not supported in this environment");
         return false;
@@ -1137,23 +1138,23 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
 
     EMSCRIPTEN_WEBSOCKET_T ws = emscripten_websocket_new(&ws_attr);
     if (ws <= 0) {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = String::from("emscripten_websocket_new failed");
         return false;
     }
 
-    emscripten_websocket_set_onopen_callback(ws, m_impl, +[](int, const EmscriptenWebSocketOpenEvent*, void* user_data) -> EM_BOOL {
+    emscripten_websocket_set_onopen_callback(ws, m_impl, +[](int, const EmscriptenWebSocketOpenEvent*, void* user_data) -> EM_BOOL { // keel-lint: ignore
         auto* self = static_cast<Impl*>(user_data);
-        std::lock_guard<std::mutex> lk(self->mutex);
+        LockGuard<Mutex> lk(self->mutex);
         self->state = WebSocketState::Connected;
         return EM_TRUE;
     });
 
-    emscripten_websocket_set_onmessage_callback(ws, m_impl, +[](int, const EmscriptenWebSocketMessageEvent* ev, void* user_data) -> EM_BOOL {
+    emscripten_websocket_set_onmessage_callback(ws, m_impl, +[](int, const EmscriptenWebSocketMessageEvent* ev, void* user_data) -> EM_BOOL { // keel-lint: ignore
         auto* self = static_cast<Impl*>(user_data);
         if (!ev) return EM_TRUE;
-        std::lock_guard<std::mutex> lk(self->mutex);
+        LockGuard<Mutex> lk(self->mutex);
         if (ev->numBytes <= self->max_message_bytes) {
             WebSocketMessage msg{};
             msg.type = ev->isText ? WebSocketFrameType::Text : WebSocketFrameType::Binary;
@@ -1166,17 +1167,17 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
         return EM_TRUE;
     });
 
-    emscripten_websocket_set_onerror_callback(ws, m_impl, +[](int, const EmscriptenWebSocketErrorEvent*, void* user_data) -> EM_BOOL {
+    emscripten_websocket_set_onerror_callback(ws, m_impl, +[](int, const EmscriptenWebSocketErrorEvent*, void* user_data) -> EM_BOOL { // keel-lint: ignore
         auto* self = static_cast<Impl*>(user_data);
-        std::lock_guard<std::mutex> lk(self->mutex);
+        LockGuard<Mutex> lk(self->mutex);
         self->state = WebSocketState::Error;
         self->last_error = String::from("WebSocket error event");
         return EM_TRUE;
     });
 
-    emscripten_websocket_set_onclose_callback(ws, m_impl, +[](int, const EmscriptenWebSocketCloseEvent* ev, void* user_data) -> EM_BOOL {
+    emscripten_websocket_set_onclose_callback(ws, m_impl, +[](int, const EmscriptenWebSocketCloseEvent* ev, void* user_data) -> EM_BOOL { // keel-lint: ignore
         auto* self = static_cast<Impl*>(user_data);
-        std::lock_guard<std::mutex> lk(self->mutex);
+        LockGuard<Mutex> lk(self->mutex);
         self->state = WebSocketState::Disconnected;
         WebSocketMessage close_msg{};
         close_msg.type = WebSocketFrameType::Close;
@@ -1186,7 +1187,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     });
 
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->ws_handle = ws;
     }
     return true;
@@ -1194,7 +1195,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
 #elif defined(KEEL_HTTP_HAS_CURL) && (LIBCURL_VERSION_NUM >= 0x075600)
     CURL* curl = curl_easy_init();
     if (!curl) {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = String::from("curl_easy_init failed for WebSocket");
         return false;
@@ -1203,7 +1204,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     const String url_str = String::from(url);
     curl_easy_setopt(curl, CURLOPT_URL, url_str.c_str());
     curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::max<u32>(500u, options.connect_timeout_ms)));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(keel::max<u32>(500u, options.connect_timeout_ms))); // keel-lint: ignore
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, options.verify_tls_peer ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, options.verify_tls_peer ? 2L : 0L);
     if (!options.user_agent.empty() && is_safe_header_token(options.user_agent.as_ref())) {
@@ -1230,7 +1231,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
         curl_slist_free_all(header_list);
     }
     if (res != CURLE_OK) {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->state = WebSocketState::Error;
         m_impl->last_error = String::from(curl_easy_strerror(res));
         curl_easy_cleanup(curl);
@@ -1238,7 +1239,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     }
 
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->curl = curl;
         m_impl->read_timeout_ms = keel::max<u32>(500u, options.connect_timeout_ms);
         m_impl->state = WebSocketState::Connected;
@@ -1246,7 +1247,7 @@ bool WebSocketClient::connect(StringRef url, const WebSocketConnectOptions& opti
     return true;
 #else
     (void)options;
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     m_impl->state = WebSocketState::Error;
     m_impl->last_error = String::from("WebSocket backend not available in this build");
     return false;
@@ -1258,7 +1259,7 @@ bool WebSocketClient::send_text(StringRef text) {
 #if defined(_WIN32)
     HINTERNET h_ws = nullptr;
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         if (m_impl->state != WebSocketState::Connected || !m_impl->h_websocket) return false;
         h_ws = m_impl->h_websocket.get();
     }
@@ -1270,14 +1271,14 @@ bool WebSocketClient::send_text(StringRef text) {
     );
     return err == NO_ERROR;
 #elif defined(__EMSCRIPTEN__)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->state != WebSocketState::Connected || m_impl->ws_handle <= 0) return false;
     const String copy = String::from(text);
     return emscripten_websocket_send_utf8_text(m_impl->ws_handle, copy.c_str()) == EMSCRIPTEN_RESULT_SUCCESS;
 #elif defined(KEEL_HTTP_HAS_CURL) && (LIBCURL_VERSION_NUM >= 0x075600)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->state != WebSocketState::Connected || !m_impl->curl) return false;
-    size_t sent = 0;
+    usize sent = 0;
     return curl_ws_send(m_impl->curl, text.data(), text.size(), &sent, 0, CURLWS_TEXT) == CURLE_OK;
 #else
     (void)text;
@@ -1290,7 +1291,7 @@ bool WebSocketClient::send_binary(ArrayRef<u8> payload) {
 #if defined(_WIN32)
     HINTERNET h_ws = nullptr;
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         if (m_impl->state != WebSocketState::Connected || !m_impl->h_websocket) return false;
         h_ws = m_impl->h_websocket.get();
     }
@@ -1302,17 +1303,17 @@ bool WebSocketClient::send_binary(ArrayRef<u8> payload) {
     );
     return err == NO_ERROR;
 #elif defined(__EMSCRIPTEN__)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->state != WebSocketState::Connected || m_impl->ws_handle <= 0) return false;
     return emscripten_websocket_send_binary(
         m_impl->ws_handle,
         const_cast<u8*>(payload.data()),
-        static_cast<uint32_t>(payload.size())
+        as<u32>(payload.size())
     ) == EMSCRIPTEN_RESULT_SUCCESS;
 #elif defined(KEEL_HTTP_HAS_CURL) && (LIBCURL_VERSION_NUM >= 0x075600)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->state != WebSocketState::Connected || !m_impl->curl) return false;
-    size_t sent = 0;
+    usize sent = 0;
     return curl_ws_send(m_impl->curl, payload.data(), payload.size(), &sent, 0, CURLWS_BINARY) == CURLE_OK;
 #else
     (void)payload;
@@ -1328,7 +1329,7 @@ bool WebSocketClient::receive(WebSocketMessage& out_message) {
     HINTERNET h_ws = nullptr;
     usize max_bytes = 0;
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         if (m_impl->state != WebSocketState::Connected || !m_impl->h_websocket) return false;
         h_ws = m_impl->h_websocket.get();
         max_bytes = m_impl->max_message_bytes;
@@ -1340,7 +1341,7 @@ bool WebSocketClient::receive(WebSocketMessage& out_message) {
         WINHTTP_WEB_SOCKET_BUFFER_TYPE buf_type = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
         const DWORD err = WinHttpWebSocketReceive(h_ws, chunk, sizeof(chunk), &bytes_read, &buf_type);
         if (err != NO_ERROR) {
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
+            LockGuard<Mutex> lk(m_impl->mutex);
             m_impl->state = WebSocketState::Error;
             m_impl->last_error = format_winhttp_error("WinHttpWebSocketReceive failed", err);
             return false;
@@ -1354,13 +1355,13 @@ bool WebSocketClient::receive(WebSocketMessage& out_message) {
             out_message.type = WebSocketFrameType::Close;
             out_message.close_status = status;
             out_message.data.append(ArrayRef<u8>(reinterpret_cast<const u8*>(reason_buf), static_cast<usize>(reason_consumed)));
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
+            LockGuard<Mutex> lk(m_impl->mutex);
             m_impl->state = WebSocketState::Disconnected;
             return true;
         }
 
         if (out_message.data.size() + bytes_read > max_bytes) {
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
+            LockGuard<Mutex> lk(m_impl->mutex);
             m_impl->state = WebSocketState::Error;
             m_impl->last_error = String::from("WebSocket message exceeded max_message_bytes");
             return false;
@@ -1378,26 +1379,26 @@ bool WebSocketClient::receive(WebSocketMessage& out_message) {
     }
 
 #elif defined(__EMSCRIPTEN__)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->incoming_queue.empty()) return false;
     out_message = keel::move(m_impl->incoming_queue.front());
     m_impl->incoming_queue.pop_front();
     return true;
 
 #elif defined(KEEL_HTTP_HAS_CURL) && (LIBCURL_VERSION_NUM >= 0x075600)
-    const auto deadline = std::chrono::steady_clock::now() + [&]() {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
-        return std::chrono::milliseconds(m_impl->read_timeout_ms);
+    const u64 deadline_ns = monotonic_ns() + [&]() -> u64 {
+        LockGuard<Mutex> lk(m_impl->mutex);
+        return as<u64>(m_impl->read_timeout_ms) * 1000000ULL;
     }();
 
     u8 chunk[8192];
     for (;;) {
-        size_t rlen = 0;
+        usize rlen = 0;
         const struct curl_ws_frame* meta = nullptr;
         CURLcode res = CURLE_OK;
         usize max_bytes = 0;
         {
-            std::lock_guard<std::mutex> lk(m_impl->mutex);
+            LockGuard<Mutex> lk(m_impl->mutex);
             if (m_impl->state != WebSocketState::Connected || !m_impl->curl) return false;
             max_bytes = m_impl->max_message_bytes;
             res = curl_ws_recv(m_impl->curl, chunk, sizeof(chunk), &rlen, &meta);
@@ -1423,10 +1424,10 @@ bool WebSocketClient::receive(WebSocketMessage& out_message) {
             }
         }
         if (res == CURLE_AGAIN) {
-            if (std::chrono::steady_clock::now() >= deadline) {
+            if (monotonic_ns() >= deadline_ns) {
                 return false;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            sleep_ms(2u);
             continue;
         }
         out_message.data.append(ArrayRef<u8>(chunk, rlen));
@@ -1445,7 +1446,7 @@ void WebSocketClient::close(u16 status_code, StringRef reason) noexcept {
 #if defined(_WIN32)
     HINTERNET h_ws = nullptr;
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         if (m_impl->h_websocket && m_impl->state == WebSocketState::Connected) {
             h_ws = m_impl->h_websocket.get();
             m_impl->state = WebSocketState::Closing;
@@ -1460,12 +1461,12 @@ void WebSocketClient::close(u16 status_code, StringRef reason) noexcept {
         );
     }
     {
-        std::lock_guard<std::mutex> lk(m_impl->mutex);
+        LockGuard<Mutex> lk(m_impl->mutex);
         m_impl->cleanup_handles();
         m_impl->state = WebSocketState::Disconnected;
     }
 #elif defined(__EMSCRIPTEN__)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->ws_handle > 0) {
         const String reason_str = String::from(reason.substr(0, keel::min<usize>(reason.size(), 120u)));
         emscripten_websocket_close(m_impl->ws_handle, status_code, reason_str.c_str());
@@ -1473,9 +1474,9 @@ void WebSocketClient::close(u16 status_code, StringRef reason) noexcept {
     }
     m_impl->state = WebSocketState::Disconnected;
 #elif defined(KEEL_HTTP_HAS_CURL) && (LIBCURL_VERSION_NUM >= 0x075600)
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     if (m_impl->curl && m_impl->state == WebSocketState::Connected) {
-        size_t sent = 0;
+        usize sent = 0;
         curl_ws_send(m_impl->curl, "", 0, &sent, 0, CURLWS_CLOSE);
     }
     m_impl->cleanup_handles();
@@ -1485,7 +1486,7 @@ void WebSocketClient::close(u16 status_code, StringRef reason) noexcept {
 #else
     (void)status_code;
     (void)reason;
-    std::lock_guard<std::mutex> lk(m_impl->mutex);
+    LockGuard<Mutex> lk(m_impl->mutex);
     m_impl->state = WebSocketState::Disconnected;
 #endif
 }
